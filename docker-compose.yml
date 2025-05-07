@@ -1,0 +1,7 @@
+services:
+  telegram-bot:
+    build: .
+    env_file: .env
+    volumes:
+      - ./data:/app/data  # for persisting quota.json
+    restart: unless-stopped
