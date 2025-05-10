@@ -12,7 +12,7 @@ docker compose build
 docker compose up -d
 ```
 
-There's a daily limit of 2 downloads per user, unless you add your User ID to the whitelist with /whitelist add <user ID>. Only the admin-user can do this.
+There's a daily limit of 2 downloads per user, unless you add your User ID to the whitelist with `/whitelist add <user ID>`. Only the admin-user can do this.
 
 ## Example
 
