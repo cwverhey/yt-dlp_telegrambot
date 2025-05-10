@@ -96,6 +96,40 @@ def is_whitelisted(user_id: int):
     whitelist = load_whitelist()
     return user_id in whitelist
 
+def get_resolution_ffprobe(path: str):
+    try:
+        cmd = ['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height', '-of', 'json', path]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        data = json.loads(result.stdout)
+        width = data['streams'][0]['width']
+        height = data['streams'][0]['height']
+        if width < 1 or height < 1:
+            return None, None
+        return width, height
+    except:
+        return None, None
+
+def get_duration_ffprobe(path: str):
+    try:
+        cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', path]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, text=True)
+        return float(result.stdout.strip())
+    except:
+        return None
+
+def get_screenshot_ffmpeg(video_path: str, time: float):
+    if time is None:
+        return None
+    
+    image_path = os.path.join(os.path.dirname(video_path), 'screenshot.jpg')
+    print(image_path)
+    try:
+        cmd = ['ffmpeg', '-v', 'error', '-ss', str(time), '-i', video_path, '-frames:v', '1', '-n', image_path]
+        subprocess.run(cmd, check=True)
+        return open(image_path, 'rb')
+    except:
+        return None
+
 ###
 
 async def get_streams(message, url: str):
@@ -143,6 +177,8 @@ async def spotdl_get_streams(url: str) -> dict:
 
 async def ytdlp_get_streams(url: str) -> dict:
     cmd = ['yt-dlp', '--dump-single-json', url]
+    if os.path.exists('cookies.txt'):
+        cmd.extend(['--cookies','cookies.txt'])
     run = subprocess.run(cmd, capture_output=True, text=True)
     data = run.stdout.strip()
     #print(data)
@@ -246,14 +282,15 @@ async def download_stream_spotdl(message, stream: dict, dir: str):
 
 async def download_stream_ytdlp(message, stream: dict, dir: str):
     
-    streams = '+'.join(stream['streams'])
-    cmd = f"yt-dlp --newline --progress-delta 1 -f {streams} -o '{dir}/%(title)s.%(ext)s' {shlex.quote(stream['url'])}"
+    cmd = ['yt-dlp', '--newline', '--progress-delta', '1', '-f', '+'.join(stream['streams']), '-o', os.path.join(dir, '%(title)s.%(ext)s'), stream['url']]
 
-    process = await asyncio.create_subprocess_shell(
-        cmd,
+    if os.path.exists('cookies.txt'):
+        cmd.extend(['--cookies', 'cookies.txt'])
+
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        cwd=dir
+        stderr=asyncio.subprocess.STDOUT
     )
 
     msg = await message.reply_text("`Starting yt-dlp...`", parse_mode="Markdown")
@@ -274,17 +311,21 @@ async def send_download(message, filepath: str, audio_only: bool):
         if audio_only:
             await message.reply_audio(audio=open(filepath, 'rb'))
         else:
-            await message.reply_video(video=open(filepath, 'rb'))
-    except Exception as e:
+            width, height = get_resolution_ffprobe(filepath)  # width, height, duration and thumbnail are optional for reply_video(), but without them the Telegram client often messes up the preview and the playback
+            duration = get_duration_ffprobe(filepath)
+            screenshot = get_screenshot_ffmpeg(filepath, duration*0.1)
+            await message.reply_video(video=open(filepath, 'rb'), width=width, height=height, duration=duration, thumbnail=screenshot)
+    except Exception as e1:
+        print(e1)
         try:
             await message.reply_document(document=open(filepath, 'rb'))
-        except Exception as e:
-            await message.reply_text(f"Failed to send: {e}")
+        except Exception as e2:
+            await message.reply_text(f"Failed to send: {e1}, {e2}")
 
 ####
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Hi! I can download video and audio from YouTube, Facebook, Instagram, TikTok, Spotify, SoundCloud, …. For this I use the open source projects *yt-dlp* and *spotdl*.\n\nI will only download video/audio that can be viewed inside Telegram: mp4 format and <50MB.\n\nSend a URL to start downloading.", parse_mode="Markdown")
+    await update.message.reply_text(f"Hi! I can download video and audio from YouTube, Facebook, Instagram, TikTok, Spotify, SoundCloud, …. For this I use the open source projects *yt-dlp* and *spotdl*.\n\nI will only download video/audio that can be viewed inside Telegram: mp4 format and <50MB.\n\nThere's a limit of {DAILY_LIMIT} downloads per 24h. If you want more, you'll need to run your own bot: https://github.com/cwverhey/yt-dlp_telegrambot/\n\nSend a URL to start downloading.", parse_mode="Markdown")
 
 async def whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
