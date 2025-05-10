@@ -4,25 +4,45 @@ import os
 import subprocess
 import shlex
 import json
-from datetime import datetime, timezone, timedelta
-from filelock import FileLock
-from telegram import Update, error
-from telegram.ext import Application, CommandHandler, ContextTypes, Updater, CommandHandler, MessageHandler, filters, CallbackContext
-from dotenv import load_dotenv
-from typing import List
-from itertools import product
-from pprint import pprint
+import uuid
 import re
 import html
+import time
+from datetime import datetime, timezone, timedelta
+from filelock import FileLock
+from telegram import Update, error, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, ContextTypes, CommandHandler, MessageHandler, filters, CallbackQueryHandler
+from dotenv import load_dotenv
+from itertools import product
+from pprint import pprint
 
 # Load environment variables
 load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_TELEGRAM_ID"))
+DAILY_LIMIT = int(os.getenv("DAILY_LIMIT"))
 QUOTA_FILE = "data/quota.json"
 LOCK_FILE = "data/quota.json.lock"
-DAILY_LIMIT = 2
-WHITELIST = set([72906842])  # Optional: add Telegram user IDs here that don't have a quota
+WHITELIST_FILE = "data/whitelist.json"
+WHITELIST_LOCK_FILE = "data/whitelist.json.lock"
+
+# Store callback data with timestamps for auto-cleanup (48 hours lifetime)
+callback_payloads = {}
+
+###
+
+def load_whitelist():
+    if not os.path.exists(WHITELIST_FILE):
+        return []
+    with FileLock(WHITELIST_LOCK_FILE):
+        with open(WHITELIST_FILE, 'r') as f:
+            return json.load(f)
+
+def save_whitelist(data):
+    with FileLock(WHITELIST_LOCK_FILE):
+        with open(WHITELIST_FILE, 'w') as f:
+            json.dump(data, f)
 
 def load_quota():
     if not os.path.exists(QUOTA_FILE):
@@ -36,17 +56,18 @@ def save_quota(data):
         with open(QUOTA_FILE, 'w') as f:
             json.dump(data, f)
 
-def check_and_update_quota(user_id: str) -> bool:
+def check_and_update_quota(user_id: int) -> bool:
     now = datetime.now(timezone.utc)
     quota = load_quota()
-    user_id = str(user_id)
-    user_data = [ts for ts in quota.get(user_id, []) if now - datetime.fromisoformat(ts).replace(tzinfo=timezone.utc) < timedelta(days=1)]
+    pprint(quota)
 
+    user_data = [ts for ts in quota.get(str(user_id), []) if now - datetime.fromisoformat(ts).replace(tzinfo=timezone.utc) < timedelta(days=1)]
     if len(user_data) >= DAILY_LIMIT:
         return False
 
     user_data.append(now.isoformat())
-    quota[user_id] = user_data
+    quota[str(user_id)] = user_data
+    pprint(quota)
     save_quota(quota)
     return True
 
@@ -59,102 +80,174 @@ def clean_text(str: str, max_len = 0):
         return str[:max_len-1].strip() + '…'
     return str.strip()
 
-async def ytdlp_fetch_metadata(update: Update, url: str) -> List:
+def cleanup_old_callbacks():
+    """Remove callback_payloads items older than 48 hours"""
+    now = time.time()
+    expired_keys = [key for key, (payload, timestamp) in callback_payloads.items() 
+                   if now - timestamp > 48 * 3600]
+    
+    for key in expired_keys:
+        del callback_payloads[key]
+    
+    if expired_keys:
+        print(f"Cleaned up {len(expired_keys)} expired callback payloads")
 
-    status_msg = await update.message.reply_text('Fetching metadata...', parse_mode="HTML")
+def is_whitelisted(user_id: int):
+    whitelist = load_whitelist()
+    return user_id in whitelist
 
+###
+
+async def get_streams(message, url: str):
+
+    user_id = message.chat_id
+    print(f'userID {user_id} get_streams: {url}')
+
+    base_msg = f'<code>{url}</code>'
+    msg = await message.reply_text(base_msg+"\n\nFetching metadata...", parse_mode="HTML")
+
+    if url.startswith('https://open.spotify.com/track/'):
+        streams = await spotdl_get_streams(url)
+    else:
+        streams = await ytdlp_get_streams(url)
+
+    #print('[streams]')
+    #pprint(streams)
+
+    base_msg += f'\n\n<b>{clean_text(streams["metadata"].get("title","unknown title"), 30)}</b>'
+    base_msg += f'\n<b>Uploaded by</b> {clean_text(streams["metadata"].get("uploader","unknown"), 20)}'
+    base_msg += f' <b>on</b> {clean_text(streams["metadata"].get("upload_date","unknown"), 10)}'
+    
+    if streams['streams']:
+        keyboard = []
+        for s in streams['streams']:
+            uid = 'download:'+str(uuid.uuid4())
+            callback_payloads[uid] = (s, time.time())
+            keyboard.append(InlineKeyboardButton(s['label'], callback_data=uid))
+    else:
+        uid = 'get:'+str(uuid.uuid4())
+        callback_payloads[uid] = (url, time.time())
+        keyboard = [InlineKeyboardButton('🔄 retry', callback_data=uid)]
+    
+    await msg.edit_text(base_msg + f"\n\n{len(streams['streams'])} suitable download option(s) found:", reply_markup=InlineKeyboardMarkup([keyboard]), parse_mode="HTML")
+    
+    # Clean up old callback data occasionally
+    if len(callback_payloads) > 1000:
+        cleanup_old_callbacks()
+
+async def spotdl_get_streams(url: str) -> dict:
+    return {'metadata': {},
+            'streams': [
+                {'label': '🎵 audio', 'tool': 'spotdl', 'url': url, 'audio_only': True }
+            ]}
+
+async def ytdlp_get_streams(url: str) -> dict:
     cmd = ['yt-dlp', '--dump-single-json', url]
     run = subprocess.run(cmd, capture_output=True, text=True)
-    metadata = json.loads(run.stdout.strip())
+    data = run.stdout.strip()
+    #print(data)
 
-    if metadata is None:
-        await status_msg.edit_text('Could not get metadata 😞')
-        return {'formats': [], 'duration': 1}
+    metadata = json.loads(data)
+    if metadata is None or metadata.get('duration') is None or metadata.get('formats') is None:
+        return {'metadata': {}, 'streams': []}
 
-    str = f'<b>{clean_text(metadata['title'], 40)}</b>\n' + \
-        f'<b>Duration</b> {metadata['duration']} seconds, <b>uploaded</b> {clean_text(metadata['upload_date'], 20)} <b>by</b> {clean_text(metadata['uploader'], 50)}\n' + \
-        f'<b>Description</b> {clean_text(metadata['description'], 60)}\n'
+    language_preferences = [f['language_preference'] for f in metadata['formats'] if 'language_preference' in f]
+    max_language_preference = max(language_preferences) if language_preferences else -1
     
-    await status_msg.edit_text(str, parse_mode="HTML")
-    
-    return metadata
-
-def ytdlp_best_streams(formats_in, duration, max_size_bytes) -> List:
-
-    max_bitrate = max_size_bytes * 8 / duration
-
     video_allowed = ['mp4', 'h264']
     audio_allowed = ['mp4', 'mp3', 'aac', 'm4a']
+    missing_data  = [None, 'none']
+    max_size_bytes = 48*1024*1024
+    
+    formats = {'both': {}, 'video': {}, 'audio': {}}
+    for f in metadata['formats']:
 
-    formats = {'both': [], 'video': [], 'audio': []}
-    for f in formats_in:
-
-        if (f.get('filesize') is None or f.get('filesize') > max_size_bytes) and (f.get('tbr') is None or f.get('tbr') > max_bitrate):
+        if f.get('filesize') not in missing_data:
+            size = f['filesize']
+        elif f.get('tbr') not in missing_data:
+            size = f['tbr'] * metadata['duration'] * 1024 / 8
+        else:
             continue
 
-        size = f['filesize'] if f.get('filesize') is not None else duration * f['tbr'] * 1024 / 8
-
         video_ok = f.get('vcodec') in video_allowed or f.get('video_ext') in video_allowed
-        audio_ok = f.get('acodec') in audio_allowed or f.get('audio_ext') in audio_allowed
+        audio_ok = (f.get('acodec') in audio_allowed or f.get('audio_ext') in audio_allowed) and f.get('language_preference', -1) == max_language_preference
 
-        print(f['format_id'], video_ok, audio_ok, size)
+        print(f"format_id {f['format_id']}, size {size}, video_ok {video_ok}, audio_ok {audio_ok}")
 
-        if video_ok and audio_ok:
-            formats['both'].append([ size, [f['format_id']] ])
+        if size > max_size_bytes:
+            continue
+        elif video_ok and audio_ok:
+            formats['both'][size] = [ f['format_id'] ]
         elif video_ok and f['audio_ext'] in [None, 'none']:
-            formats['video'].append([ size, f['format_id'] ])
+            formats['video'][size] = [ f['format_id'] ]
         elif audio_ok and f['video_ext'] in [None, 'none']:
-            formats['audio'].append([ size, f['format_id'] ])
+            formats['audio'][size] = [ f['format_id'] ]
 
-    for audio, video in product(formats['audio'], formats['video']):
-        size = audio[0] + video[0]
+    for (size_a, audio), (size_v, video) in product(formats['audio'].items(), formats['video'].items()):
+        size = size_a + size_v
         if size <= max_size_bytes:
-            formats['both'].append([ size, [audio[1], video[1]] ])
+            formats['both'][size] = audio + video
 
-    formats_both = sorted(formats['both'], key=lambda x: -x[0])
+    #print('[formats]')
+    #pprint(formats)
 
-    if formats_both:
-        return formats_both[0][1]
-    else:
-        return []
+    best_formats = {k: v[max(v.keys())] if v else None for k, v in formats.items()}
 
-async def download(update: Update, url: str, audio_only=False):
+    #print('[best_formats]')
+    #pprint(best_formats)
 
-    max_size_bytes = 49*1024*1024  # 49 MB in bytes
-    user_id = update.effective_user.id
-    print(f'userID {update.effective_user.id} download: {url}')
+    streams = []
+    if best_formats['both']:
+        streams.append({'label': '🎬 video', 'tool': 'yt-dlp', 'url': url, 'streams': best_formats['both'], 'audio_only': False })
+    if best_formats['video']:
+        streams.append({'label': '🔇 video (no audio)', 'tool': 'yt-dlp', 'url': url, 'streams': best_formats['video'], 'audio_only': False })
+    if best_formats['audio']:
+        streams.append({'label': '🎵 audio', 'tool': 'yt-dlp', 'url': url, 'streams': best_formats['audio'], 'audio_only': True })
 
-    if not check_and_update_quota(user_id) and user_id not in WHITELIST:
+    return {'metadata': metadata, 'streams': streams}
+
+###
+
+async def download_stream(message, stream):
+
+    user_id = message.chat_id
+    print(f'userID {user_id} download_stream: {stream}')
+
+    # Check quota - whitelist bypasses quota
+    if not is_whitelisted(user_id) and not check_and_update_quota(user_id):
         print(f'quota exceeded')
-        await update.message.reply_text(f"Quota exceeded: {DAILY_LIMIT} downloads per 24 hours. (User ID: {user_id})")
+        await message.reply_text(f"Quota exceeded: {DAILY_LIMIT} downloads per 24 hours. (User ID: {user_id})")
         return
 
+    msg = await message.reply_text(f'Downloading {stream["label"]}...')
     with tempfile.TemporaryDirectory() as tmpdir:
         try:
-            if url.startswith('https://open.spotify.com/track/'):
-                # spotdl
-                audio_only = True
-                await spotdl_get_download(update, url, tmpdir)
+            if stream['tool'] == 'spotdl':
+                await download_stream_spotdl(message, stream, tmpdir)
             else:
-                # yt-dlp
-                metadata = await ytdlp_fetch_metadata(update, url)
-                streams = ytdlp_best_streams(metadata['formats'], metadata['duration'], max_size_bytes)
-                await ytdlp_get_download(update, url, tmpdir, streams, audio_only)
-        except:
-            pass
+                await download_stream_ytdlp(message, stream, tmpdir)
 
-        await send_download(update, tmpdir, audio_only)
+            files = os.listdir(tmpdir)
+            if not files:
+                await msg.edit_text("Download failed 😞")
+                return
+            await msg.edit_text(f'Sending {stream["label"]}...')
+            await send_download(message, os.path.join(tmpdir, files[0]), stream['audio_only'])
 
-async def ytdlp_get_download(update: Update, url: str, dir: str, streams: List[str], audio_only=False):
+            await msg.delete()
 
-    if not streams:
-        return
+        except Exception as e:
+            print('An internal error occurred: ' + str(e))
+            await msg.edit_text('An internal error occurred: ' + str(e))
+
+async def download_stream_spotdl(message, stream: dict, dir: str):
+    process = await asyncio.create_subprocess_shell(f"spotdl download {shlex.quote(stream['url'])}", cwd=dir)
+    await process.wait()
+
+async def download_stream_ytdlp(message, stream: dict, dir: str):
     
-    cmd_streams = '-f ' + '+'.join(streams)
-    if audio_only:
-        cmd = f"yt-dlp -x --newline --progress-delta 2 {cmd_streams} -o '{dir}/%(title)s.%(ext)s' {shlex.quote(url)}"
-    else:
-        cmd = f"yt-dlp --newline --progress-delta 2 {cmd_streams} -o '{dir}/%(title)s.%(ext)s' {shlex.quote(url)}"
+    streams = '+'.join(stream['streams'])
+    cmd = f"yt-dlp --newline --progress-delta 1 -f {streams} -o '{dir}/%(title)s.%(ext)s' {shlex.quote(stream['url'])}"
 
     process = await asyncio.create_subprocess_shell(
         cmd,
@@ -163,80 +256,110 @@ async def ytdlp_get_download(update: Update, url: str, dir: str, streams: List[s
         cwd=dir
     )
 
-    status_msg = await update.message.reply_text("Starting download...")
+    msg = await message.reply_text("`Starting yt-dlp...`", parse_mode="Markdown")
     while True:
         line = await process.stdout.readline()
         if not line:
             break
         try:
-            await status_msg.edit_text(f"Downloading:\n`{clean_text(line.decode(),60)}`", parse_mode="Markdown")
+            await msg.edit_text(f"`{clean_text(line.decode(),60)}`", parse_mode="Markdown")
         except error.BadRequest:
             pass
 
     await process.wait()
-    await status_msg.delete()
+    await msg.delete()
 
-async def spotdl_get_download(update: Update, url: str, dir: str):
-    
-    cmd = f"spotdl download {shlex.quote(url)}"
-    process = await asyncio.create_subprocess_shell(cmd, cwd=dir)
-
-    status_msg = await update.message.reply_text("Downloading...")
-    await process.wait()
-    
-    await status_msg.delete()
-
-async def send_download(update: Update, dir: str, audio_only=False):
-    files = os.listdir(dir)
-    if not files:
-        await update.message.reply_text("Download failed 😞")
-        return
-    
-    status_msg = await update.message.reply_text('Download complete 😀 sending file...')
-    filepath = os.path.join(dir, files[0])
-
+async def send_download(message, filepath: str, audio_only: bool):
     try:
         if audio_only:
-            print('send audio')
-            await update.message.reply_audio(audio=open(filepath, 'rb'))
+            await message.reply_audio(audio=open(filepath, 'rb'))
         else:
-            print('send video')
-            await update.message.reply_video(video=open(filepath, 'rb'))
+            await message.reply_video(video=open(filepath, 'rb'))
     except Exception as e:
         try:
-            print('send document')
-            await update.message.reply_document(document=open(filepath, 'rb'))
+            await message.reply_document(document=open(filepath, 'rb'))
         except Exception as e:
-            await update.message.reply_text(f"Failed to send: {e}")
+            await message.reply_text(f"Failed to send: {e}")
 
-    await status_msg.delete()
+####
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Hi! I can download video and audio from YouTube, Facebook, Instagram, TikTok, Spotify, SoundCloud, …. For this I use the open source projects *yt-dlp* and *spotdl*.\n\nI will only download video/audio that can be viewed inside Telegram: mp4 format and <50MB.\n\nSend a URL to start downloading.", parse_mode="Markdown")
+
+async def whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    if user_id != ADMIN_ID:
+        await update.message.reply_text(f"You don't have permission to use this command. (User ID: {user_id})")
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage:\n/whitelist add <userID> - Add user to whitelist\n/whitelist remove <userID> - Remove user from whitelist")
+        
+        whitelist = load_whitelist()
+        if whitelist:
+            await update.message.reply_text(f"Current whitelist: {', '.join(map(str, whitelist))}")
+        else:
+            await update.message.reply_text("Whitelist is empty.")
+        return
+        
+    action = context.args[0].lower()
+    
+    if action not in ['add', 'remove'] or len(context.args) != 2:
+        await update.message.reply_text("Usage:\n/whitelist add <userID> - Add user to whitelist\n/whitelist remove <userID> - Remove user from whitelist")
+        return
+        
+    try:
+        target_id = int(context.args[1])
+        whitelist = load_whitelist()
+        
+        if action == 'add':
+            if target_id in whitelist:
+                await update.message.reply_text(f"User {target_id} is already whitelisted.")
+            else:
+                whitelist.append(target_id)
+                save_whitelist(whitelist)
+                await update.message.reply_text(f"User {target_id} added to whitelist.")
+        else:  # remove
+            if target_id not in whitelist:
+                await update.message.reply_text(f"User {target_id} is not in the whitelist.")
+            else:
+                whitelist.remove(target_id)
+                save_whitelist(whitelist)
+                await update.message.reply_text(f"User {target_id} removed from whitelist.")
+    except ValueError:
+        await update.message.reply_text("User ID must be a number.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
-    if text and not text.startswith('/'):
-        await download(update, text, audio_only=False)
-
-async def video_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.args:
-        await download(update, context.args[0], audio_only=False)
+    match = re.search(r'https?://[^\s)]+', text)
+    if match:
+        await get_streams(update.message, match.group(0))
     else:
-        await update.message.reply_text("Usage: /video <URL>")
+        await update.message.reply_text("No URL found. Send a URL to start downloading.")
 
-async def audio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.args:
-        await download(update, context.args[0], audio_only=True)
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data in callback_payloads:
+        payload, _ = callback_payloads[query.data]
+        if query.data.startswith('get:'):
+            await get_streams(query.message, payload)
+        if query.data.startswith('download:'):
+            await download_stream(query.message, payload)
     else:
-        await update.message.reply_text("Usage: /audio <URL>")
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send /video <url> or /audio <url> to download.")
+        await query.edit_message_text("This request has expired (48 hours).")
 
 def main():
+
+    os.makedirs('data', exist_ok=True)
+
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("video", video_command))
-    app.add_handler(CommandHandler("audio", audio_command))
+    app.add_handler(CommandHandler("whitelist", whitelist_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(handle_button))
     
     print("Bot started.")
     app.run_polling()

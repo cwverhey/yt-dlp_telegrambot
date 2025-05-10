@@ -13,4 +13,4 @@ RUN chmod 0644 /etc/cron.d/pip-update
 RUN crontab /etc/cron.d/pip-update
 RUN touch /var/log/cron.log
 
-CMD cron && tail -f /var/log/cron.log & python bot.py
+CMD cron && tail -f /var/log/cron.log & python -u bot.py
