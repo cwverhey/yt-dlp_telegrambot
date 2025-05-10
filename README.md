@@ -1,5 +1,6 @@
 # yt-dlp_telegrambot
 <img align="right" width="288" height="626" src="https://i.imgur.com/iRa51WQ.jpeg">
+
 Telegram bot interface for [yt-dlp](https://github.com/yt-dlp/yt-dlp) and [spotdl](https://github.com/spotDL/spotify-downloader). Only downloads formats that can be played by Telegram: mp4/aac/h264, max. 50MB.
 
 ### Setup
