@@ -16,6 +16,11 @@ docker compose build
 docker compose up -d
 ```
 
+To ensure the bot gets restarted after a reboot:
+```
+sudo systemctl enable docker
+```
+
 There's a limit of 2 downloads per 24h per user, unless you add their User ID number to the whitelist with `/whitelist add <user ID>`. Only the admin-user can do this.
 
 #### Cookies
