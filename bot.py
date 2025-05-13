@@ -8,6 +8,7 @@ import uuid
 import re
 import html
 import time
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 from filelock import FileLock
 from telegram import Update, error, InlineKeyboardButton, InlineKeyboardMarkup
@@ -59,7 +60,6 @@ def save_quota(data):
 def check_and_update_quota(user_id: int) -> bool:
     now = datetime.now(timezone.utc)
     quota = load_quota()
-    pprint(quota)
 
     user_data = [ts for ts in quota.get(str(user_id), []) if now - datetime.fromisoformat(ts).replace(tzinfo=timezone.utc) < timedelta(days=1)]
     if len(user_data) >= DAILY_LIMIT:
@@ -67,7 +67,6 @@ def check_and_update_quota(user_id: int) -> bool:
 
     user_data.append(now.isoformat())
     quota[str(user_id)] = user_data
-    pprint(quota)
     save_quota(quota)
     return True
 
@@ -122,7 +121,6 @@ def get_screenshot_ffmpeg(video_path: str, time: float):
         return None
     
     image_path = os.path.join(os.path.dirname(video_path), 'screenshot.jpg')
-    print(image_path)
     try:
         cmd = ['ffmpeg', '-v', 'error', '-ss', str(time), '-i', video_path, '-frames:v', '1', '-n', image_path]
         subprocess.run(cmd, check=True)
@@ -152,18 +150,20 @@ async def get_streams(message, url: str):
     base_msg += f'\n<b>Uploaded by</b> {clean_text(streams["metadata"].get("uploader","unknown"), 20)}'
     base_msg += f' <b>on</b> {clean_text(streams["metadata"].get("upload_date","unknown"), 10)}'
     
-    if streams['streams']:
-        keyboard = []
-        for s in streams['streams']:
-            uid = 'download:'+str(uuid.uuid4())
-            callback_payloads[uid] = (s, time.time())
-            keyboard.append(InlineKeyboardButton(s['label'], callback_data=uid))
-    else:
+    keyboard = []
+
+    for s in streams['streams']:
+        uid = 'download:'+str(uuid.uuid4())
+        callback_payloads[uid] = (s, time.time())
+        keyboard.append(InlineKeyboardButton(s['label'], callback_data=uid))
+
+    if not streams['streams']:
         uid = 'get:'+str(uuid.uuid4())
         callback_payloads[uid] = (url, time.time())
-        keyboard = [InlineKeyboardButton('🔄 retry', callback_data=uid)]
-    
-    await msg.edit_text(base_msg + f"\n\n{len(streams['streams'])} suitable download option(s) found:", reply_markup=InlineKeyboardMarkup([keyboard]), parse_mode="HTML")
+        keyboard.append(InlineKeyboardButton('🔄 retry', callback_data=uid))
+        keyboard.append(InlineKeyboardButton('📃 archive.ph', url=f'https://archive.ph/submit/?url={urllib.parse.quote(url)}'))
+            
+    await msg.edit_text(base_msg + f"\n\nFound {len(streams['streams'])} suitable download option(s):", reply_markup=InlineKeyboardMarkup([keyboard]), parse_mode="HTML")
     
     # Clean up old callback data occasionally
     if len(callback_payloads) > 1000:
@@ -251,7 +251,7 @@ async def download_stream(message, stream):
 
     # Check quota - whitelist bypasses quota
     if not is_whitelisted(user_id) and not check_and_update_quota(user_id):
-        print(f'quota exceeded')
+        print(f'Quota exceeded')
         await message.reply_text(f"Quota exceeded: {DAILY_LIMIT} downloads per 24 hours. (User ID: {user_id})")
         return
 
@@ -293,13 +293,13 @@ async def download_stream_ytdlp(message, stream: dict, dir: str):
         stderr=asyncio.subprocess.STDOUT
     )
 
-    msg = await message.reply_text("`Starting yt-dlp...`", parse_mode="Markdown")
+    msg = await message.reply_text("<code>Starting yt-dlp...</code>", parse_mode="HTML")
     while True:
         line = await process.stdout.readline()
         if not line:
             break
         try:
-            await msg.edit_text(f"`{clean_text(line.decode(),60)}`", parse_mode="Markdown")
+            await msg.edit_text(f"<code>{html.escape(clean_text(line.decode(),60))}</code>", parse_mode="HTML")
         except error.BadRequest:
             pass
 
@@ -316,7 +316,7 @@ async def send_download(message, filepath: str, audio_only: bool):
             screenshot = get_screenshot_ffmpeg(filepath, duration*0.1)
             await message.reply_video(video=open(filepath, 'rb'), width=width, height=height, duration=duration, thumbnail=screenshot)
     except Exception as e1:
-        print(e1)
+        print('Error in send_download():', e1)
         try:
             await message.reply_document(document=open(filepath, 'rb'))
         except Exception as e2:
@@ -325,7 +325,7 @@ async def send_download(message, filepath: str, audio_only: bool):
 ####
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Hi! I can download video and audio from YouTube, Facebook, Instagram, TikTok, Spotify, SoundCloud, …. For this I use the open source projects *yt-dlp* and *spotdl*.\n\nI will only download video/audio that can be viewed inside Telegram: mp4 format and <50MB.\n\nThere's a limit of {DAILY_LIMIT} downloads per 24h. If you want more, you'll need to run your own bot: https://github.com/cwverhey/yt-dlp_telegrambot/\n\nSend a URL to start downloading.", parse_mode="Markdown")
+    await update.message.reply_text(f"Hi! I can download video and audio from YouTube, Facebook, Instagram, TikTok, Spotify, SoundCloud, …. For this I use the open source projects <code>yt-dlp</code> and <code>spotdl</code>.\n\nI will only download video/audio that can be viewed inside Telegram: mp4 format and &lt;50MB.\n\nThere's a limit of {DAILY_LIMIT} downloads per 24h. If you want more, you'll need to run your own bot: https://github.com/cwverhey/yt-dlp_telegrambot/\n\nSend a URL to start downloading.", parse_mode="HTML", disable_web_page_preview=True)
 
 async def whitelist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
