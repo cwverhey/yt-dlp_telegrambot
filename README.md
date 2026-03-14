@@ -29,5 +29,10 @@ To enable `yt-dlp` to download age-restricted content, supply `cookies.txt`. See
 - https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp
 - https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies
 
+#### Maintenance
+
+Add a cronjob:
+@weekly docker exec $(docker ps -qf "ancestor=yt-dlp-bot-telegram-bot") pip install -U pip spotdl yt-dlp
+
 ### Example
 https://t.me/savestreambot
